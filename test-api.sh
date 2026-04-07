@@ -15,11 +15,11 @@ echo "API: $API_URL"
 echo "Escribe tu mensaje (Ctrl+C para salir)"
 echo "=========================================="
 
-# Archivos temporales para historial y respuesta
+# Archivos temporales
 HISTORY=$(mktemp /tmp/chat-history-XXXXXX.json)
-RESPONSE_FILE=$(mktemp /tmp/chat-response-XXXXXX.txt)
+RESPONSE=$(mktemp /tmp/chat-response-XXXXXX.txt)
 echo '[]' > "$HISTORY"
-trap 'rm -f "$HISTORY" "$RESPONSE_FILE" "$HISTORY.payload"' EXIT
+trap 'rm -f "$HISTORY" "$HISTORY.tmp" "$RESPONSE"' EXIT
 
 while true; do
   echo ""
@@ -30,47 +30,25 @@ while true; do
     continue
   fi
 
-  # Agregar mensaje del usuario y construir payload
-  python3 -c "
-import json, sys
+  # Agregar mensaje del usuario al historial usando jq
+  jq --arg msg "$prompt" '. += [{"role": "user", "content": $msg}]' \
+    "$HISTORY" > "$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
 
-with open('$HISTORY') as f:
-    msgs = json.load(f)
-
-msgs.append({'role': 'user', 'content': sys.argv[1]})
-
-with open('$HISTORY', 'w') as f:
-    json.dump(msgs, f)
-
-with open('$HISTORY.payload', 'w') as f:
-    json.dump({'messages': msgs}, f)
-" "$prompt"
+  # Construir payload con el historial completo
+  payload=$(jq '{messages: .}' "$HISTORY")
 
   # Stream en tiempo real + capturar respuesta en archivo
   printf "Claude: "
   curl -s --no-buffer \
     -X POST \
     -H "Content-Type: application/json" \
-    -d @"$HISTORY.payload" \
-    "$API_URL" | tee "$RESPONSE_FILE"
+    -d "$payload" \
+    "$API_URL" | tee "$RESPONSE"
 
   echo ""
 
   # Agregar respuesta del asistente al historial
-  python3 -c "
-import json, sys
-
-with open('$HISTORY') as f:
-    msgs = json.load(f)
-
-with open(sys.argv[1]) as f:
-    response = f.read()
-
-msgs.append({'role': 'assistant', 'content': response})
-
-with open('$HISTORY', 'w') as f:
-    json.dump(msgs, f)
-" "$RESPONSE_FILE"
-
-  rm -f "$HISTORY.payload"
+  response=$(<"$RESPONSE")
+  jq --arg msg "$response" '. += [{"role": "assistant", "content": $msg}]' \
+    "$HISTORY" > "$HISTORY.tmp" && mv "$HISTORY.tmp" "$HISTORY"
 done

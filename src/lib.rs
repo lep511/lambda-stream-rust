@@ -1,6 +1,8 @@
 /// Lógica de negocio reutilizable para Lambda Bedrock Streaming.
 ///
 /// Modelo soportado: Anthropic Claude Sonnet 4.6 vía Bedrock.
+pub mod telegram;
+
 use std::env;
 
 use bytes::Bytes;

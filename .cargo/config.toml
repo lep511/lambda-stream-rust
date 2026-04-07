@@ -1,9 +1,9 @@
-# Optimización para AWS Graviton4 (Neoverse V2)
-# Lambda arm64 en provided.al2023 corre sobre Graviton — compilar nativo.
+# Optimización para AWS Graviton2 (Neoverse N1) — el CPU de Lambda arm64.
+# Esta máquina es Graviton4, pero Lambda corre en Graviton2.
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = [
-    "-C", "target-cpu=neoverse-v2",   # Graviton4: SVE2, BF16, I8MM, CSSC
+    "-C", "target-cpu=neoverse-n1",   # Graviton2: compatible con Lambda arm64
     "-C", "link-arg=-Wl,-z,now",      # Full RELRO — reduce PLT overhead
     "-C", "link-arg=-Wl,-O1",         # Optimización del linker
 ]

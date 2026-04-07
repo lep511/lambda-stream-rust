@@ -51,6 +51,7 @@ async fn handler(
         request_id,
         cold_start = cold,
         function_arn = %event.context.invoked_function_arn,
+        event = %serde_json::to_string(&event.payload).unwrap_or_default(),
         "request iniciado"
     );
 
@@ -58,7 +59,12 @@ async fn handler(
     let raw: ApiGatewayEvent = match serde_json::from_value(event.payload.clone()) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(request_id, "evento inválido: {e}");
+            tracing::warn!(
+                request_id,
+                error = %e,
+                latency_ms = start.elapsed().as_millis() as u64,
+                "evento de API Gateway inválido"
+            );
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 &format!("evento inválido: {e}"),
@@ -69,7 +75,11 @@ async fn handler(
     let body_str = match raw.body {
         Some(b) => b,
         None => {
-            tracing::warn!(request_id, "body vacío");
+            tracing::warn!(
+                request_id,
+                latency_ms = start.elapsed().as_millis() as u64,
+                "body vacío en el evento de API Gateway"
+            );
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "body vacío en el evento de API Gateway",
@@ -77,10 +87,22 @@ async fn handler(
         }
     };
 
+    // Detectar si es un webhook de Telegram y derivar al handler específico
+    if stream_rust::telegram::is_telegram_update(&body_str) {
+        tracing::info!(request_id, "webhook de Telegram detectado");
+        return stream_rust::telegram::use_telegram(bedrock, &body_str, request_id).await;
+    }
+
     let req: PromptRequest = match serde_json::from_str(&body_str) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(request_id, "JSON inválido: {e}");
+            tracing::warn!(
+                request_id,
+                error = %e,
+                body_preview = %&body_str[..body_str.len().min(200)],
+                latency_ms = start.elapsed().as_millis() as u64,
+                "JSON de body inválido"
+            );
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 &format!("JSON de body inválido: {e}"),
@@ -89,7 +111,12 @@ async fn handler(
     };
 
     if !is_known_model(&req.model_id) {
-        tracing::warn!(request_id, model = %req.model_id, "modelo no reconocido");
+        tracing::warn!(
+            request_id,
+            model = %req.model_id,
+            latency_ms = start.elapsed().as_millis() as u64,
+            "modelo no reconocido"
+        );
         return Ok(error_response(
             StatusCode::BAD_REQUEST,
             &format!(
@@ -115,7 +142,14 @@ async fn handler(
     let bedrock_body = match build_model_body(&req) {
         Some(body) => body,
         None => {
-            tracing::warn!(request_id, "body sin 'prompt' ni 'messages'");
+            tracing::warn!(
+                request_id,
+                model = %req.model_id,
+                has_prompt = req.prompt.is_some(),
+                has_messages = req.messages.is_some(),
+                latency_ms = start.elapsed().as_millis() as u64,
+                "body sin 'prompt' ni 'messages'"
+            );
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "se requiere 'prompt' o 'messages'",
@@ -146,6 +180,9 @@ async fn handler(
             tracing::error!(
                 request_id,
                 error = %raw,
+                model = %req.model_id,
+                max_tokens = req.max_tokens,
+                message_count = msg_count,
                 latency_ms = start.elapsed().as_millis() as u64,
                 "error al invocar Bedrock"
             );
@@ -199,9 +236,11 @@ async fn handler(
                 Err(e) => {
                     tracing::error!(
                         request_id = rid,
+                        error = %e,
                         chunk_count,
+                        total_bytes,
                         duration_ms = stream_start.elapsed().as_millis() as u64,
-                        "Bedrock stream error: {e}"
+                        "Bedrock stream error durante lectura de chunks"
                     );
                     let _ = tx.send_data(Bytes::from(format!("\n[ERROR: {e}]"))).await;
                     break;

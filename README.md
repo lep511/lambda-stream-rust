@@ -3,19 +3,39 @@
 ## Arquitectura
 
 ```
-Cliente (stream-client o curl)
-  |  POST /prod/invoke  {"prompt":"..."}
-  v
-API Gateway REST
-  |  responseTransferMode = STREAM
-  |  credentials: ApiGatewayLambdaRole (assume role)
-  v
-Lambda (Rust, provided.al2023, arm64)
-  |  lambda_runtime::run + StreamResponse
-  |  lambda_runtime::streaming::channel() tx/rx
-  v
-Bedrock InvokeModelWithResponseStream
-  |  chunked -> tx -> rx -> cliente
+                          ┌─────────────────────┐
+                          │   Telegram Bot API   │
+                          │  (webhook -> Lambda) │
+                          └────────┬────────────┘
+                                   │ POST /webhook
+                                   v
+Cliente (curl / stream-client)    Lambda (Rust, provided.al2023, arm64)
+  │  POST /prod/invoke            ├─ Detecta formato del body:
+  │  {"prompt":"..."}             │   ├─ PromptRequest  -> streaming directo al cliente
+  v                               │   └─ TelegramUpdate -> streaming a Telegram via Bot API
+API Gateway REST                  │
+  │  responseTransferMode=STREAM  │  lambda_runtime::streaming::channel() tx/rx
+  v                               v
+                          Bedrock InvokeModelWithResponseStream
+                            │  chunked -> tx -> rx -> cliente / editMessageText
+```
+
+### Flujo directo (API Gateway)
+
+```
+Cliente -> API Gateway -> Lambda -> Bedrock stream -> channel tx/rx -> Cliente (chunks)
+```
+
+### Flujo Telegram (webhook)
+
+```
+Telegram webhook -> Lambda
+  <- 200 OK "{}" (inmediato via channel, evita timeout de Telegram)
+  [tokio::spawn] sendChatAction(typing)
+               -> sendMessage(placeholder "▍") -> obtiene message_id
+               -> Bedrock stream -> editMessageText cada ~1s (streaming progresivo)
+               -> editMessageText final (texto completo)
+  <- stream cerrado (tx dropped)
 ```
 
 ## Recursos desplegados (SAM)
@@ -46,7 +66,7 @@ pip3 install aws-sam-cli
 ## Build y Deploy
 
 ```bash
-# Build (compila via Makefile, optimizado para Graviton4)
+# Build (compila via Makefile, optimizado para Graviton2)
 sam build
 
 # Validar template
@@ -57,21 +77,24 @@ sam deploy
 
 # Deploy guiado (primera vez, genera samconfig.toml)
 sam deploy --guided
+
+# Deploy con token de Telegram
+sam deploy --parameter-overrides TelegramBotToken=<tu-token>
 ```
 
-### Optimizacion para Graviton4
+### Optimizacion para Graviton
 
-El build esta optimizado para **AWS Graviton4 (Neoverse V2)** mediante tres archivos:
+El build esta optimizado para **AWS Graviton2 (Neoverse N1)**, que es el procesador que usa Lambda arm64:
 
 | Archivo | Funcion |
 |---------|---------|
-| `.cargo/config.toml` | `target-cpu=neoverse-v2` — habilita SVE2, BF16, I8MM, CSSC y crypto HW. Full RELRO y optimizacion del linker |
+| `.cargo/config.toml` | `target-cpu=neoverse-n1` — compatible con Lambda arm64 (Graviton2). Full RELRO y optimizacion del linker |
 | `Cargo.toml` (profile.release) | `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true` — binario minimo con inlining agresivo |
 | `Makefile` | Target `build-BedrockStreamFunction` invocado por `sam build` — compila para `aarch64-unknown-linux-gnu` y copia el artefacto |
 
-SAM usa `BuildMethod: makefile` en el template, que ejecuta `make build-BedrockStreamFunction`. Las flags de `.cargo/config.toml` se aplican automaticamente.
+> **Importante:** Lambda arm64 usa Graviton2 (Neoverse N1), no Graviton4. Usar `target-cpu=neoverse-v2` genera instrucciones SVE2/BF16 que causan `illegal instruction` en Lambda.
 
-El resultado es un binario de ~11 MB con instrucciones AES/SHA/PMULL nativas, acelerando el handshake TLS con Bedrock por hardware.
+SAM usa `BuildMethod: makefile` en el template, que ejecuta `make build-BedrockStreamFunction`. Las flags de `.cargo/config.toml` se aplican automaticamente.
 
 ### Configuracion (samconfig.toml)
 
@@ -96,8 +119,96 @@ region = "us-west-2"
 | Parametro          | Default                                | Descripcion                               |
 |--------------------|----------------------------------------|-------------------------------------------|
 | `BedrockModelId`   | `anthropic.claude-sonnet-4-6-v1:0`     | Model ID de Bedrock                       |
+| `TelegramBotToken` | `""` (NoEcho)                          | Token del bot de Telegram para Bot API    |
 | `LambdaMemorySize` | `256`                                  | Memoria de la Lambda (MB)                 |
 | `LambdaTimeout`    | `120`                                  | Timeout de la Lambda (segundos)           |
+
+## Integracion con Telegram
+
+La Lambda detecta automaticamente si el body es un webhook de Telegram (presencia de `update_id` + `message`) y lo procesa con streaming progresivo.
+
+### Configurar el webhook de Telegram
+
+#### 1. Crear Function URL para la Lambda
+
+```bash
+# Crear Function URL con CORS
+aws lambda create-function-url-config \
+  --function-name rust-stream-bedrock-stream \
+  --auth-type NONE \
+  --cors '{
+    "AllowOrigins": ["*"],
+    "AllowMethods": ["POST"],
+    "AllowHeaders": ["content-type"],
+    "MaxAge": 300
+  }'
+
+# Obtener la Function URL
+FUNCTION_URL=$(aws lambda get-function-url-config \
+  --function-name rust-stream-bedrock-stream \
+  --query 'FunctionUrl' \
+  --output text)
+
+echo "Function URL: $FUNCTION_URL"
+```
+
+> **Nota:** `--auth-type NONE` es necesario porque Telegram no soporta autenticacion IAM. La Lambda valida el formato del webhook internamente.
+
+#### 2. Agregar permiso publico a la Function URL
+
+```bash
+aws lambda add-permission \
+  --function-name rust-stream-bedrock-stream \
+  --statement-id telegram-webhook-public \
+  --action lambda:InvokeFunctionUrl \
+  --principal "*" \
+  --function-url-auth-type NONE
+```
+
+#### 3. Registrar el webhook en Telegram
+
+```bash
+export FUNCTION_URL="<tu-function-url>"
+export TELEGRAM_TOKEN="<tu-bot-token>"
+
+# Registrar el webhook
+curl -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d "{\"url\": \"${FUNCTION_URL}\"}"
+
+# Verificar el estado del webhook
+curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getWebhookInfo" | jq .
+```
+
+#### 4. Configurar el bot token en la Lambda
+
+```bash
+# Via SAM deploy
+sam deploy --parameter-overrides TelegramBotToken=$TELEGRAM_TOKEN
+
+# O directamente en la Lambda
+aws lambda update-function-configuration \
+  --function-name rust-stream-bedrock-stream \
+  --environment "Variables={BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6,TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN}"
+```
+
+### Como funciona el streaming en Telegram
+
+A diferencia del flujo directo donde Lambda hace streaming via el channel al cliente, en Telegram el streaming se implementa editando el mensaje progresivamente:
+
+1. **Respuesta inmediata** — Lambda retorna 200 OK al webhook via `channel()` al instante, evitando el timeout de 60s de Telegram.
+2. **Procesamiento en background** — `tokio::spawn` ejecuta todo el flujo Bedrock + Telegram sin bloquear la respuesta del webhook.
+3. **Placeholder** — Se envia un mensaje con `▍` (cursor) al chat.
+4. **Ediciones progresivas** — Cada ~1 segundo se edita el mensaje con el texto acumulado + cursor, dando efecto de "escritura en tiempo real".
+5. **Edicion final** — Al completar el stream, se edita con el texto completo sin cursor.
+
+Si la respuesta excede 4096 caracteres (limite de Telegram), se trunca con sufijo `… [truncado]`.
+
+### Eliminar el webhook
+
+```bash
+curl -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/deleteWebhook"
+```
 
 ## Crear API Gateway REST (import)
 
@@ -194,6 +305,21 @@ export AWS_REGION=us-west-2
 cargo run --bin stream -- "Hola"
 ```
 
+### Prueba del bot de Telegram
+
+```bash
+# Enviar un mensaje de prueba directamente a la Lambda
+aws lambda invoke \
+  --function-name rust-stream-bedrock-stream \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "body": "{\"update_id\":1,\"message\":{\"message_id\":1,\"from\":{\"id\":123,\"is_bot\":false,\"first_name\":\"Test\"},\"chat\":{\"id\":123,\"type\":\"private\"},\"date\":0,\"text\":\"Hola\"}}"
+  }' \
+  /tmp/telegram-test.json
+
+cat /tmp/telegram-test.json
+```
+
 ### Prueba CORS (preflight)
 
 ```bash
@@ -224,6 +350,9 @@ cargo test test_extract_delta
 cargo test test_model_validation
 cargo test test_prompt_request
 cargo test test_responses
+
+# Tests de Telegram
+cargo test test_telegram
 ```
 
 ### Verificar logs en CloudWatch
@@ -238,6 +367,8 @@ Los logs son JSON estructurados (`LogFormat: JSON` en Globals) con campos para c
 | `model`, `max_tokens`, `message_count` | Parametros del request a Bedrock |
 | `latency_ms` | Tiempo hasta que Bedrock abre el stream (o falla) |
 | `chunk_count`, `total_bytes`, `duration_ms` | Metricas del streaming completado |
+| `edit_count` | Numero de ediciones a Telegram durante el stream |
+| `placeholder_msg_id` | ID del mensaje de Telegram que se edita progresivamente |
 
 ```bash
 # Ver logs recientes de la Lambda
@@ -248,6 +379,9 @@ sam logs --stack-name rust-stream --filter "ERROR"
 
 # Filtrar cold starts
 sam logs --stack-name rust-stream --filter "cold_start"
+
+# Filtrar mensajes de Telegram
+sam logs --stack-name rust-stream --filter "Telegram"
 
 # Filtrar por latencia de Bedrock
 sam logs --stack-name rust-stream --filter "latency_ms"
@@ -277,6 +411,7 @@ Request 1 (cold start)          Request 2 (warm)            Request 3 (warm)
 |                       |       |                     |     |                     |
 | handler() invocacion  |       | handler() nueva     |     | handler() nueva     |
 |   + parsear body      |       |   + parsear body    |     |   + parsear body    |
+|   + detectar formato  |       |   + detectar formato|     |   + detectar formato|
 |   + invocar Bedrock   |       |   + invocar Bedrock |     |   + invocar Bedrock |
 |   + stream chunks     |       |   + stream chunks   |     |   + stream chunks   |
 +-----------------------+       +---------------------+     +---------------------+
@@ -284,7 +419,7 @@ Request 1 (cold start)          Request 2 (warm)            Request 3 (warm)
 ```
 
 - **`main()`** corre una sola vez por contenedor: inicializa el `BedrockClient`, el tracing subscriber y el AWS config. Estos se reutilizan en invocaciones posteriores.
-- **`handler()`** se ejecuta en cada invocacion pero reutiliza el cliente de Bedrock.
+- **`handler()`** se ejecuta en cada invocacion pero reutiliza el cliente de Bedrock. Detecta si el body es un `PromptRequest` o un `TelegramUpdate` y enruta al flujo correspondiente.
 - El campo `cold_start` en los logs marca `true` solo la primera invocacion de cada contenedor.
 
 ## Costos del streaming
@@ -314,7 +449,8 @@ El beneficio del streaming es mejorar el TTFB: el usuario ve texto llegando inme
 - La integracion usa `credentials` (rol IAM) para que API Gateway invoque la Lambda, en vez de `AWS::Lambda::Permission`.
 - El canal `lambda_runtime::streaming::channel()` permite enviar chunks sin bloquear el handler.
 - El `tokio::spawn` es necesario para que el handler retorne el `Response` con el receiver mientras el sender sigue enviando datos en background.
-- Cold start con Rust + ARM64 (Graviton4) ~ 80-120ms.
+- Para Telegram, el `tokio::spawn` cumple doble funcion: retorna 200 al webhook inmediatamente y mantiene la Lambda viva mientras procesa el stream de Bedrock y edita el mensaje.
+- Cold start con Rust + ARM64 (Graviton2) ~ 80-120ms.
 
 ## Concurrencia (provisioned concurrency)
 

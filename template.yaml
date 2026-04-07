@@ -11,6 +11,11 @@ Parameters:
     Type: String
     Default: "us.anthropic.claude-sonnet-4-6"
     Description: Model ID de Bedrock (debe estar habilitado en Model Access)
+  TelegramBotToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Token del bot de Telegram para enviar respuestas via Bot API
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +47,7 @@ Resources:
       Environment:
         Variables:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
       Policies:
         - Statement:
             - Effect: Allow
