@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda Bedrock Streaming (Rust) — Streaming de respuestas Claude
+  vía API Gateway REST con responseTransferMode STREAM.
+
+# ─── Parámetros ───────────────────────────────────────────────────────────────
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: Model ID de Bedrock (debe estar habilitado en Model Access)
+
+# ─── Globals ──────────────────────────────────────────────────────────────────
+
+Globals:
+  Function:
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+
+# ─── Recursos ─────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── Lambda Function ──────────────────────────────────────────────────────
+
+  BedrockStreamFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-bedrock-stream"
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 120
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:GetModel
+              Resource:
+                - "arn:aws:bedrock:*::foundation-model/*"
+                - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+
+  # ── Rol IAM para que API Gateway invoque Lambda con streaming ─────────
+
+  ApiGatewayLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-apigw-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyName: InvokeLambdaStreaming
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:InvokeFunctionUrl
+                Resource: !GetAtt BedrockStreamFunction.Arn
+
+  # ── Log Group (retención explícita) ──────────────────────────────────────
+
+  BedrockStreamLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BedrockStreamFunction}"
+      RetentionInDays: 14
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt BedrockStreamFunction.Arn
+
+  FunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref BedrockStreamFunction
+
+  ApiGatewayLambdaRoleArn:
+    Description: ARN of the IAM Role
+    Value: !GetAtt ApiGatewayLambdaRole.Arn
+

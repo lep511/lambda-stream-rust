@@ -1,0 +1,40 @@
+[package]
+name = "stream-rust"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[[bin]]
+name = "stream"
+path = "src/stream_client.rs"
+
+[[bin]]
+name = "test-bedrock"
+path = "src/test_bedrock.rs"
+
+[dependencies]
+lambda_runtime = "1.1.2"
+aws-config   = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
+http         = "1"
+tokio        = { version = "1", features = ["full"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes        = "1"
+anyhow       = "1"
+clap         = { version = "4",    features = ["derive"] }
+reqwest      = { version = "0.12", features = ["stream", "json"] }
+futures-util = "0.3"
+
+[profile.release]
+opt-level    = 3
+lto          = "fat"           # LTO completo — mejor inlining cross-crate
+codegen-units = 1
+strip        = true
+panic        = "abort"         # Elimina unwind tables — binario más pequeño, cold start más rápido

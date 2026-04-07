@@ -1,0 +1,12 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "rust-stream"
+resolve_s3 = true
+s3_prefix = "rust-stream"
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "BedrockModelId=\"us.anthropic.claude-sonnet-4-6\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-west-2"

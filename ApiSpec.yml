@@ -1,0 +1,26 @@
+openapi: "3.0.1"
+info:
+  title: "APIGW-ResponseStreamingRust"
+  version: "2025-04-28T17:28:25Z"
+servers:
+- url: "{basePath}"
+  variables:
+    basePath:
+      default: "prod"
+paths:
+  /lambda:
+    post:
+      x-amazon-apigateway-integration:
+        httpMethod: "POST"
+        uri: REPLACE_ME_1
+        passthroughBehavior: "when_no_match"
+        type: "aws_proxy"
+        timeoutInMillis: 29000
+        responseTransferMode: "STREAM"
+        credentials: REPLACE_ME_2
+
+components:
+  schemas:
+    Empty:
+      title: "Empty Schema"
+      type: "object"
