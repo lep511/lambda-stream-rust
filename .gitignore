@@ -1,2 +1,31 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+!Cargo.lock
+
+# AWS SAM
 .aws-sam/
+
+# Environment and secrets
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives and binaries
+*.zip
+*.tar.gz
+*.exe
