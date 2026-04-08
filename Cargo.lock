@@ -2143,6 +2143,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
+ "base64",
  "bytes",
  "clap",
  "futures-util",

@@ -19,12 +19,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    PromptRequest, build_model_body, default_max_tokens, default_model,
+    default_max_tokens, default_model,
     extract_text_delta, streaming_response,
 };
+use crate::stream_markdown::md_to_telegram_markdownv2;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 /// Límite de caracteres por mensaje en la API de Telegram.
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+
+/// Mínimo de caracteres acumulados antes de enviar el primer mensaje.
+/// Evita que el mensaje inicial sea demasiado corto y parpadee en Telegram.
+const INITIAL_MESSAGE_MIN_CHARS: usize = 15;
 
 /// Intervalo mínimo entre ediciones del mensaje en Telegram (ms).
 /// Evita rate-limiting de la Bot API (~30 req/s por chat).
@@ -64,6 +70,10 @@ pub struct TelegramMessage {
     pub date: i64,
     /// Contenido de texto del mensaje. `None` si es una foto, sticker, etc.
     pub text: Option<String>,
+    /// Array de tamaños de foto (presente si el mensaje es una foto).
+    pub photo: Option<Vec<TelegramPhotoSize>>,
+    /// Caption de una foto, video, documento, etc.
+    pub caption: Option<String>,
 }
 
 /// Representa un usuario de Telegram.
@@ -109,6 +119,26 @@ pub struct TelegramChat {
     pub chat_type: String,
 }
 
+/// Representa un tamaño de foto enviada por Telegram.
+///
+/// Telegram envía múltiples resoluciones de la misma foto.
+/// La última en el array es la de mayor resolución.
+///
+/// Referencia: <https://core.telegram.org/bots/api#photosize>
+#[derive(Debug, Deserialize)]
+pub struct TelegramPhotoSize {
+    /// Identificador del archivo, usado para descargar vía `getFile`.
+    pub file_id: String,
+    /// Identificador único del archivo.
+    pub file_unique_id: String,
+    /// Tamaño del archivo en bytes (opcional).
+    pub file_size: Option<i64>,
+    /// Ancho de la foto en píxeles.
+    pub width: i32,
+    /// Alto de la foto en píxeles.
+    pub height: i32,
+}
+
 /// Respuesta de la Bot API de Telegram al enviar un mensaje.
 ///
 /// Solo se extraen los campos necesarios para editar el mensaje
@@ -128,6 +158,25 @@ struct TelegramApiResponse {
 struct TelegramSentMessage {
     /// ID del mensaje enviado, necesario para `editMessageText`.
     message_id: i64,
+}
+
+/// Respuesta de `getFile` de la Bot API de Telegram.
+#[derive(Debug, Deserialize)]
+struct TelegramFileResponse {
+    ok: bool,
+    result: Option<TelegramFile>,
+}
+
+/// Objeto File retornado por `getFile`.
+#[derive(Debug, Deserialize)]
+struct TelegramFile {
+    file_path: Option<String>,
+}
+
+/// Tipo de input del usuario: texto simple o foto con caption.
+enum UserInput {
+    Text(String),
+    Photo { file_id: String, caption: String },
 }
 
 // ─── Detección ─────────────────────────────────────────────────────────────
@@ -161,7 +210,7 @@ pub fn is_telegram_update(body: &str) -> bool {
 /// el webhook mientras Bedrock genera la respuesta.
 ///
 /// El procesamiento en background:
-/// 1. Envía `sendChatAction(typing)` y un mensaje placeholder (`▍`).
+/// 1. Envía `sendChatAction(typing)`.
 /// 2. Invoca Bedrock streaming.
 /// 3. Por cada chunk, acumula texto y edita el mensaje cada ~1 segundo.
 /// 4. Edición final con el texto completo (sin cursor).
@@ -217,9 +266,19 @@ pub async fn use_telegram(
         }
     };
 
-    let text = match &message.text {
-        Some(t) if !t.is_empty() => t.clone(),
-        _ => {
+    // 2. Determinar tipo de input: texto o foto
+    let has_photo = message.photo.as_ref().is_some_and(|p| !p.is_empty());
+    let user_input = if has_photo {
+        let photos = message.photo.as_ref().unwrap();
+        let largest = photos.last().unwrap();
+        let caption = message.caption.clone()
+            .unwrap_or_else(|| "Describe esta imagen".to_string());
+        UserInput::Photo {
+            file_id: largest.file_id.clone(),
+            caption,
+        }
+    } else if let Some(ref t) = message.text {
+        if t.is_empty() {
             tracing::info!(
                 request_id,
                 update_id = update.update_id,
@@ -228,38 +287,20 @@ pub async fn use_telegram(
             );
             return Ok(ok_empty_response());
         }
+        UserInput::Text(t.clone())
+    } else {
+        tracing::info!(
+            request_id,
+            update_id = update.update_id,
+            message_id = message.message_id,
+            "mensaje de Telegram sin texto ni foto, ignorando"
+        );
+        return Ok(ok_empty_response());
     };
 
-    // 3. Loguear toda la información relevante del update
     let chat_id = message.chat.id;
-    let (from_id, from_name, from_username, from_lang) = match &message.from {
-        Some(user) => (
-            Some(user.id),
-            Some(user.first_name.as_str()),
-            user.username.as_deref(),
-            user.language_code.as_deref(),
-        ),
-        None => (None, None, None, None),
-    };
 
-    tracing::info!(
-        request_id,
-        update_id = update.update_id,
-        message_id = message.message_id,
-        from_id,
-        from_name,
-        from_username,
-        from_language = from_lang,
-        chat_id,
-        chat_type = %message.chat.chat_type,
-        chat_first_name = message.chat.first_name.as_deref().unwrap_or(""),
-        chat_username = message.chat.username.as_deref().unwrap_or(""),
-        date = message.date,
-        text = %text,
-        "mensaje de Telegram recibido"
-    );
-
-    // 4. Leer el bot token de la variable de entorno
+    // 3. Leer el bot token de la variable de entorno
     let bot_token = match env::var("TELEGRAM_BOT_TOKEN") {
         Ok(t) if !t.is_empty() => t,
         _ => {
@@ -268,32 +309,16 @@ pub async fn use_telegram(
         }
     };
 
-    // 5. Preparar el payload de Bedrock antes del spawn
-    let req = PromptRequest {
-        prompt: Some(text),
-        messages: None,
-        model_id: default_model(),
-        max_tokens: default_max_tokens(),
-    };
+    let model_id = default_model();
+    let max_tokens = default_max_tokens();
 
-    let bedrock_body = match build_model_body(&req) {
-        Some(body) => body,
-        None => {
-            tracing::error!(request_id, "no se pudo construir el body de Bedrock");
-            return Ok(ok_empty_response());
-        }
-    };
-    let blob = Blob::new(serde_json::to_vec(&bedrock_body)?);
-
-    // 6. Crear canal de streaming Lambda
+    // 5. Crear canal de streaming Lambda
     //    tx se mueve al spawn — Lambda mantiene la invocación abierta mientras tx exista.
     //    El send_data("{}" ) se hace DENTRO del spawn para que Lambda no cierre antes.
     let (tx, rx) = channel();
 
-    // 7. Spawn: enviar 200 OK + procesar Bedrock + Telegram
+    // 6. Spawn: enviar 200 OK + procesar Bedrock + Telegram
     let rid = request_id.to_string();
-    let model_id = req.model_id.clone();
-    let max_tokens = req.max_tokens;
     let bedrock = bedrock.clone();
 
     tokio::spawn(async move {
@@ -305,6 +330,62 @@ pub async fn use_telegram(
 
         // 7a. Enviar typing indicator (sin placeholder visible)
         send_chat_action(&http_client, &bot_token, chat_id).await;
+
+        // 7a.1 Construir payload de Bedrock (descarga imagen si es foto)
+        let blob = match user_input {
+            UserInput::Text(ref text) => {
+                let body = json!({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": text}]
+                });
+                Blob::new(serde_json::to_vec(&body).unwrap())
+            }
+            UserInput::Photo { ref file_id, ref caption } => {
+                let Some((image_data, media_type)) = download_telegram_photo(
+                    &http_client, &bot_token, file_id,
+                ).await else {
+                    tracing::error!(
+                        request_id = rid,
+                        "no se pudo descargar la imagen de Telegram"
+                    );
+                    send_telegram_message(
+                        &http_client, &bot_token, chat_id,
+                        "No pude descargar la imagen\\. Intenta de nuevo\\.",
+                    ).await;
+                    return;
+                };
+                tracing::info!(
+                    request_id = rid,
+                    image_bytes = image_data.len(),
+                    media_type = %media_type,
+                    "imagen descargada de Telegram"
+                );
+                let b64 = BASE64.encode(&image_data);
+                let body = json!({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 4096,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": b64,
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": caption,
+                            }
+                        ]
+                    }]
+                });
+                Blob::new(serde_json::to_vec(&body).unwrap())
+            }
+        };
 
         // 7b. Invocar Bedrock con streaming
         tracing::info!(
@@ -350,10 +431,13 @@ pub async fn use_telegram(
             }
         };
 
-        // 7c. Streaming progresivo:
-        //     - Primer chunk con texto → sendMessage (obtiene message_id)
-        //     - Chunks siguientes → editMessageText cada ~1s
+        // 7c. Streaming progresivo con split en tiempo real por "\n---\n":
+        //     - Cada segmento va en su propio mensaje de Telegram.
+        //     - Al detectar "\n---\n", se finaliza el mensaje actual y se
+        //       inicia uno nuevo para el siguiente segmento.
         let mut response_text = String::new();
+        let mut last_sent_text = String::new();
+        let mut segment_start: usize = 0;
         let mut chunk_count: u64 = 0;
         let mut edit_count: u64 = 0;
         let mut msg_id: Option<i64> = None;
@@ -370,16 +454,53 @@ pub async fn use_telegram(
                             chunk_count += 1;
                             response_text.push_str(&text_delta);
 
-                            // Primer chunk: enviar el mensaje inicial con texto real
+                            // Detectar separadores "\n---\n" en tiempo real
+                            while let Some(sep) = response_text[segment_start..].find("\n---\n") {
+                                let abs_sep = segment_start + sep;
+                                let segment = response_text[segment_start..abs_sep].trim();
+
+                                if !segment.is_empty() {
+                                    let display = truncate_for_telegram(
+                                        &md_to_telegram_markdownv2(segment),
+                                    );
+                                    if let Some(mid) = msg_id {
+                                        if display != last_sent_text {
+                                            edit_telegram_message(
+                                                &http_client, &bot_token, chat_id, mid, &display,
+                                            ).await;
+                                        }
+                                    } else {
+                                        send_telegram_message(
+                                            &http_client, &bot_token, chat_id, &display,
+                                        ).await;
+                                    }
+                                }
+
+                                // Avanzar al siguiente segmento
+                                segment_start = abs_sep + 5; // saltar "\n---\n"
+                                msg_id = None;
+                                last_sent_text = String::new();
+                            }
+
+                            // Streaming normal del segmento actual
+                            let current_segment = response_text[segment_start..].trim();
+                            if current_segment.is_empty() {
+                                continue;
+                            }
+
+                            let display = truncate_for_telegram(
+                                &md_to_telegram_markdownv2(current_segment),
+                            );
+
                             if msg_id.is_none() {
-                                let display = truncate_for_telegram(&response_text, true);
+                                // Acumular al menos 15 chars antes de enviar
+                                // el primer mensaje (evita parpadeo)
+                                if current_segment.len() < INITIAL_MESSAGE_MIN_CHARS {
+                                    continue;
+                                }
                                 msg_id = send_telegram_message(
-                                    &http_client,
-                                    &bot_token,
-                                    chat_id,
-                                    &display,
-                                )
-                                .await;
+                                    &http_client, &bot_token, chat_id, &display,
+                                ).await;
                                 if msg_id.is_none() {
                                     tracing::error!(
                                         request_id = rid,
@@ -388,22 +509,16 @@ pub async fn use_telegram(
                                     );
                                     return;
                                 }
+                                last_sent_text = display;
                                 last_edit = Instant::now();
-                                continue;
-                            }
-
-                            // Chunks siguientes: editar cada EDIT_THROTTLE_MS
-                            if last_edit.elapsed().as_millis() >= EDIT_THROTTLE_MS {
-                                let display =
-                                    truncate_for_telegram(&response_text, true);
+                            } else if last_edit.elapsed().as_millis() >= EDIT_THROTTLE_MS
+                                && display != last_sent_text
+                            {
                                 edit_telegram_message(
-                                    &http_client,
-                                    &bot_token,
-                                    chat_id,
-                                    msg_id.unwrap(),
-                                    &display,
-                                )
-                                .await;
+                                    &http_client, &bot_token, chat_id,
+                                    msg_id.unwrap(), &display,
+                                ).await;
+                                last_sent_text = display;
                                 edit_count += 1;
                                 last_edit = Instant::now();
                             }
@@ -440,26 +555,23 @@ pub async fn use_telegram(
             }
         }
 
-        // 7d. Edición final con el texto completo (sin cursor)
-        if let Some(mid) = msg_id {
-            let final_text = truncate_for_telegram(&response_text, false);
-            edit_telegram_message(
-                &http_client,
-                &bot_token,
-                chat_id,
-                mid,
-                &final_text,
-            )
-            .await;
-        } else if !response_text.is_empty() {
-            // Bedrock respondió pero nunca se envió un mensaje (edge case)
-            send_telegram_message(
-                &http_client,
-                &bot_token,
-                chat_id,
-                &truncate_for_telegram(&response_text, false),
-            )
-            .await;
+        // 7d. Edición final del último segmento
+        let final_segment = response_text[segment_start..].trim();
+        if !final_segment.is_empty() {
+            let display = truncate_for_telegram(
+                &md_to_telegram_markdownv2(final_segment),
+            );
+            if let Some(mid) = msg_id {
+                if display != last_sent_text {
+                    edit_telegram_message(
+                        &http_client, &bot_token, chat_id, mid, &display,
+                    ).await;
+                }
+            } else {
+                send_telegram_message(
+                    &http_client, &bot_token, chat_id, &display,
+                ).await;
+            }
         }
 
         tracing::info!(
@@ -484,27 +596,27 @@ pub async fn use_telegram(
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-/// Trunca el texto si excede el límite de Telegram (4096 chars).
+/// Trunca texto MarkdownV2 si excede el límite de Telegram (4096 chars).
 ///
-/// Si `with_cursor` es `true`, agrega el carácter `▍` al final para
-/// indicar visualmente que la respuesta aún se está generando.
-fn truncate_for_telegram(text: &str, with_cursor: bool) -> String {
-    let suffix = if with_cursor { " ▍" } else { "" };
-    let truncation = "… [truncado]";
+/// Los sufijos (indicador de truncado) ya están pre-escapados para
+/// MarkdownV2. Al truncar, se evita cortar a mitad de una secuencia
+/// de escape `\X`.
+fn truncate_for_telegram(text: &str) -> String {
+    // Pre-escaped para MarkdownV2: … → \.\.\., [truncado] → \[truncado\]
+    let truncation = "\\.\\.\\. \\[truncado\\]";
 
-    // Reservar espacio para el sufijo (cursor o nada)
-    let max_text_len = TELEGRAM_MAX_MESSAGE_LEN - suffix.len();
-
-    if text.len() > max_text_len {
-        let max_with_truncation = max_text_len - truncation.len();
-        let mut truncated = text[..max_with_truncation].to_string();
+    if text.len() > TELEGRAM_MAX_MESSAGE_LEN {
+        let max_with_truncation = TELEGRAM_MAX_MESSAGE_LEN - truncation.len();
+        // No cortar a mitad de una secuencia de escape \X
+        let mut end = max_with_truncation;
+        if end > 0 && text.as_bytes().get(end.wrapping_sub(1)) == Some(&b'\\') {
+            end -= 1;
+        }
+        let mut truncated = text[..end].to_string();
         truncated.push_str(truncation);
-        truncated.push_str(suffix);
         truncated
     } else {
-        let mut result = text.to_string();
-        result.push_str(suffix);
-        result
+        text.to_string()
     }
 }
 
@@ -553,6 +665,7 @@ async fn send_telegram_message(
     let body = json!({
         "chat_id": chat_id,
         "text": text,
+        "parse_mode": "MarkdownV2",
     });
 
     let resp = match client.post(&url).json(&body).send().await {
@@ -572,6 +685,22 @@ async fn send_telegram_message(
             response = %resp_body,
             "Telegram sendMessage respondió con error"
         );
+        // Fallback: si MarkdownV2 es inválido, reintentar sin parse_mode
+        if status.as_u16() == 400 && resp_body.contains("can't parse entities") {
+            tracing::info!("reintentando sendMessage sin parse_mode (fallback)");
+            let fallback_body = json!({
+                "chat_id": chat_id,
+                "text": text,
+            });
+            if let Ok(fallback_resp) = client.post(&url).json(&fallback_body).send().await {
+                let fb_body = fallback_resp.text().await.unwrap_or_default();
+                if let Ok(api_resp) = serde_json::from_str::<TelegramApiResponse>(&fb_body) {
+                    if api_resp.ok {
+                        return api_resp.result.map(|r| r.message_id);
+                    }
+                }
+            }
+        }
         return None;
     }
 
@@ -622,6 +751,7 @@ async fn edit_telegram_message(
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
+        "parse_mode": "MarkdownV2",
     });
 
     match client.post(&url).json(&body).send().await {
@@ -635,6 +765,18 @@ async fn edit_telegram_message(
                     response = %resp_body,
                     "Telegram editMessageText respondió con error"
                 );
+                // Fallback: si MarkdownV2 es inválido, reintentar sin parse_mode
+                if status.as_u16() == 400 && resp_body.contains("can't parse entities") {
+                    tracing::info!(message_id, "reintentando editMessageText sin parse_mode (fallback)");
+                    let fallback_body = json!({
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": text,
+                    });
+                    if let Err(e) = client.post(&url).json(&fallback_body).send().await {
+                        tracing::error!(error = %e, message_id, "error en fallback editMessageText");
+                    }
+                }
             }
         }
         Err(e) => {
@@ -645,6 +787,70 @@ async fn edit_telegram_message(
             );
         }
     }
+}
+
+/// Descarga una foto de Telegram dado su `file_id`.
+///
+/// 1. Llama a `getFile` para obtener el `file_path`.
+/// 2. Descarga el archivo desde `https://api.telegram.org/file/bot{token}/{path}`.
+///
+/// Retorna `(bytes, media_type)` o `None` si algo falla.
+async fn download_telegram_photo(
+    client: &reqwest::Client,
+    bot_token: &str,
+    file_id: &str,
+) -> Option<(Vec<u8>, String)> {
+    // 1. Obtener file_path vía getFile
+    let url = format!("https://api.telegram.org/bot{bot_token}/getFile");
+    let body = json!({"file_id": file_id});
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "error al llamar getFile de Telegram");
+            return None;
+        }
+    };
+    let file_resp: TelegramFileResponse = match resp.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "error al parsear respuesta de getFile");
+            return None;
+        }
+    };
+    if !file_resp.ok {
+        tracing::warn!("getFile retornó ok=false");
+        return None;
+    }
+    let file_path = file_resp.result?.file_path?;
+
+    // 2. Determinar media type por extensión
+    let media_type = if file_path.ends_with(".png") {
+        "image/png"
+    } else if file_path.ends_with(".gif") {
+        "image/gif"
+    } else if file_path.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+
+    // 3. Descargar el archivo
+    let download_url = format!("https://api.telegram.org/file/bot{bot_token}/{file_path}");
+    let data = match client.get(&download_url).send().await {
+        Ok(r) => match r.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "error al descargar archivo de Telegram");
+                return None;
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "error al conectar para descargar archivo de Telegram");
+            return None;
+        }
+    };
+
+    Some((data.to_vec(), media_type.to_string()))
 }
 
 /// Construye una respuesta HTTP 200 OK con body vacío.

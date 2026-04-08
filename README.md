@@ -32,11 +32,15 @@ Cliente -> API Gateway -> Lambda -> Bedrock stream -> channel tx/rx -> Cliente (
 Telegram webhook -> Lambda
   <- 200 OK "{}" (inmediato via channel, evita timeout de Telegram)
   [tokio::spawn] sendChatAction(typing)
-               -> sendMessage(placeholder "▍") -> obtiene message_id
-               -> Bedrock stream -> editMessageText cada ~1s (streaming progresivo)
+               -> [si foto] getFile + download -> base64
+               -> Bedrock stream (texto: 2048 tokens / imagen: 4096 tokens)
+               -> sendMessage(primer chunk) -> obtiene message_id
+               -> editMessageText cada ~1s (streaming progresivo)
                -> editMessageText final (texto completo)
   <- stream cerrado (tx dropped)
 ```
+
+Soporta mensajes de **texto** y **fotos** (con o sin caption). Para fotos, descarga la imagen de mayor resolucion via `getFile`, la codifica en base64, y la envia a Bedrock como mensaje multimodal (vision). Si la foto no tiene caption, usa "Describe esta imagen" como prompt.
 
 ## Recursos desplegados (SAM)
 
@@ -57,7 +61,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 pip3 install aws-sam-cli
 
 # Habilitar modelo en Bedrock Console > Model access
-# anthropic.claude-sonnet-4-6-v1:0
+# us.anthropic.claude-sonnet-4-6-v1:0 (cross-region inference)
 ```
 
 > **Nota:** El build usa `Makefile` + `cargo build` directamente (no `cargo-lambda`).
@@ -106,7 +110,7 @@ stack_name = "rust-stream"
 resolve_s3 = true
 s3_prefix = "rust-stream"
 capabilities = "CAPABILITY_NAMED_IAM"
-parameter_overrides = "BedrockModelId=\"anthropic.claude-sonnet-4-6-v1:0\" LambdaMemorySize=\"256\" LambdaTimeout=\"120\""
+parameter_overrides = "BedrockModelId=\"us.anthropic.claude-sonnet-4-6-v1:0\" LambdaMemorySize=\"256\" LambdaTimeout=\"120\""
 
 [default.global.parameters]
 region = "us-west-2"
@@ -118,14 +122,14 @@ region = "us-west-2"
 
 | Parametro          | Default                                | Descripcion                               |
 |--------------------|----------------------------------------|-------------------------------------------|
-| `BedrockModelId`   | `anthropic.claude-sonnet-4-6-v1:0`     | Model ID de Bedrock                       |
+| `BedrockModelId`   | `us.anthropic.claude-sonnet-4-6-v1:0`  | Model ID de Bedrock (cross-region)        |
 | `TelegramBotToken` | `""` (NoEcho)                          | Token del bot de Telegram para Bot API    |
 | `LambdaMemorySize` | `256`                                  | Memoria de la Lambda (MB)                 |
 | `LambdaTimeout`    | `120`                                  | Timeout de la Lambda (segundos)           |
 
 ## Integracion con Telegram
 
-La Lambda detecta automaticamente si el body es un webhook de Telegram (presencia de `update_id` + `message`) y lo procesa con streaming progresivo.
+La Lambda detecta automaticamente si el body es un webhook de Telegram (presencia de `update_id` + `message`) y lo procesa con streaming progresivo. Soporta mensajes de texto y fotos con vision (multimodal).
 
 ### Configurar el webhook de Telegram
 
@@ -198,9 +202,17 @@ A diferencia del flujo directo donde Lambda hace streaming via el channel al cli
 
 1. **Respuesta inmediata** — Lambda retorna 200 OK al webhook via `channel()` al instante, evitando el timeout de 60s de Telegram.
 2. **Procesamiento en background** — `tokio::spawn` ejecuta todo el flujo Bedrock + Telegram sin bloquear la respuesta del webhook.
-3. **Placeholder** — Se envia un mensaje con `▍` (cursor) al chat.
-4. **Ediciones progresivas** — Cada ~1 segundo se edita el mensaje con el texto acumulado + cursor, dando efecto de "escritura en tiempo real".
-5. **Edicion final** — Al completar el stream, se edita con el texto completo sin cursor.
+3. **Descarga de imagen** (solo fotos) — Si el mensaje contiene una foto, se descarga la de mayor resolucion via `getFile` + download, se codifica en base64, y se envia a Bedrock como mensaje multimodal.
+4. **Mensaje inicial** — Se envia el primer chunk de texto como mensaje nuevo al chat, obteniendo el `message_id`.
+5. **Ediciones progresivas** — Cada ~1 segundo se edita el mensaje con el texto acumulado, dando efecto de "escritura en tiempo real".
+6. **Edicion final** — Al completar el stream, se edita con el texto completo.
+
+**Tokens por tipo de mensaje:**
+
+| Tipo | `max_tokens` |
+|------|-------------|
+| Texto | 2048 |
+| Imagen (foto con vision) | 4096 |
 
 Si la respuesta excede 4096 caracteres (limite de Telegram), se trunca con sufijo `… [truncado]`.
 
@@ -277,7 +289,7 @@ curl -i --no-buffer \
 curl --no-buffer \
   -X POST \
   -H "Content-Type: application/json" \
-  -d '{"prompt":"Hola","model_id":"anthropic.claude-sonnet-4-6-v1:0","max_tokens":2048}' \
+  -d '{"prompt":"Hola","model_id":"us.anthropic.claude-sonnet-4-6-v1:0","max_tokens":2048}' \
   "$API_URL"
 
 # Verificar que el streaming funciona (los chunks llegan progresivamente)
@@ -351,7 +363,7 @@ cargo test test_model_validation
 cargo test test_prompt_request
 cargo test test_responses
 
-# Tests de Telegram
+# Tests de Telegram (deteccion, deserializacion, fotos)
 cargo test test_telegram
 ```
 
@@ -368,7 +380,9 @@ Los logs son JSON estructurados (`LogFormat: JSON` en Globals) con campos para c
 | `latency_ms` | Tiempo hasta que Bedrock abre el stream (o falla) |
 | `chunk_count`, `total_bytes`, `duration_ms` | Metricas del streaming completado |
 | `edit_count` | Numero de ediciones a Telegram durante el stream |
-| `placeholder_msg_id` | ID del mensaje de Telegram que se edita progresivamente |
+| `msg_id` | ID del mensaje de Telegram que se edita progresivamente |
+| `image_bytes` | Tamano de la imagen descargada de Telegram (solo fotos) |
+| `media_type` | Tipo MIME de la imagen descargada (`image/jpeg`, etc.) |
 
 ```bash
 # Ver logs recientes de la Lambda
@@ -389,9 +403,12 @@ sam logs --stack-name rust-stream --filter "latency_ms"
 
 ## Modelo soportado
 
-| Model ID                                      | Familia   |
-|-----------------------------------------------|-----------|
-| anthropic.claude-sonnet-4-6-v1:0              | Anthropic |
+| Model ID                                      | Familia   | Nota |
+|-----------------------------------------------|-----------|------|
+| us.anthropic.claude-sonnet-4-6-v1:0           | Anthropic | Default (cross-region inference) |
+| anthropic.claude-sonnet-4-6-v1:0              | Anthropic | Single-region |
+
+El default usa el prefijo `us.` para cross-region inference. Se puede cambiar con la variable de entorno `BEDROCK_MODEL_ID` o el parametro SAM `BedrockModelId`.
 
 Activa el modelo en **Bedrock Console > Model access** antes de usarlo.
 

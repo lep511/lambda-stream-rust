@@ -28,11 +28,11 @@ fn default_model_id_is_claude_sonnet() {
 }
 
 #[test]
-fn default_max_tokens_is_1024() {
+fn default_max_tokens_is_2048() {
     let json = r#"{"prompt":"Test","model_id":"anthropic.claude-sonnet-4-6-v1:0"}"#;
     let req: PromptRequest = serde_json::from_str(json).unwrap();
 
-    assert_eq!(req.max_tokens, 1024);
+    assert_eq!(req.max_tokens, 2048);
 }
 
 #[test]

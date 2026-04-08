@@ -1,6 +1,7 @@
 /// Lógica de negocio reutilizable para Lambda Bedrock Streaming.
 ///
 /// Modelo soportado: Anthropic Claude Sonnet 4.6 vía Bedrock.
+pub mod stream_markdown;
 pub mod telegram;
 
 use std::env;
@@ -34,11 +35,11 @@ pub struct PromptRequest {
 }
 
 pub fn default_model() -> String {
-    env::var("BEDROCK_MODEL_ID").unwrap_or_else(|_| "anthropic.claude-sonnet-4-6-v1:0".to_string())
+    env::var("BEDROCK_MODEL_ID").unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6-v1:0".to_string())
 }
 
 pub fn default_max_tokens() -> u32 {
-    1024
+    2048
 }
 
 // ─── Extracción de texto del stream de Bedrock ──────────────────────────────
