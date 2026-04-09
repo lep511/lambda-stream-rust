@@ -12,10 +12,16 @@
 Cliente (curl / stream-client)    Lambda (Rust, provided.al2023, arm64)
   │  POST /prod/invoke            ├─ Detecta formato del body:
   │  {"prompt":"..."}             │   ├─ PromptRequest  -> streaming directo al cliente
-  v                               │   └─ TelegramUpdate -> streaming a Telegram via Bot API
+  v                               │   └─ TelegramUpdate -> DynamoDB + Bedrock + Telegram
 API Gateway REST                  │
   │  responseTransferMode=STREAM  │  lambda_runtime::streaming::channel() tx/rx
   v                               v
+                          ┌──────────────────────┐
+                          │  DynamoDB (historial) │
+                          │  PK=CHAT#<chat_id>    │
+                          │  SK=TS#<epoch_millis>  │
+                          └──────────┬───────────┘
+                                     │
                           Bedrock InvokeModelWithResponseStream
                             │  chunked -> tx -> rx -> cliente / editMessageText
 ```
@@ -31,12 +37,20 @@ Cliente -> API Gateway -> Lambda -> Bedrock stream -> channel tx/rx -> Cliente (
 ```
 Telegram webhook -> Lambda
   <- 200 OK "{}" (inmediato via channel, evita timeout de Telegram)
-  [tokio::spawn] sendChatAction(typing)
-               -> [si foto] getFile + download -> base64
-               -> Bedrock stream (texto: 2048 tokens / imagen: 4096 tokens)
-               -> sendMessage(primer chunk) -> obtiene message_id
-               -> editMessageText cada ~1s (streaming progresivo)
-               -> editMessageText final (texto completo)
+  [tokio::spawn]
+    -> /clear? -> borrar historial DynamoDB -> "Historial borrado" -> return
+    -> sendChatAction(typing)
+    -> DynamoDB: get_metadata + get_recent_messages (paralelo)
+    -> Deduplicacion: si update_id <= last_update_id -> ignorar
+    -> DynamoDB: save_message(user) ANTES de Bedrock
+    -> Construir system prompt (nombre, idioma, conteo)
+    -> Construir messages[] con historial + mensaje actual
+    -> [si foto] getFile + download -> base64
+    -> Bedrock stream (texto: 2048 tokens / imagen: 4096 tokens)
+    -> sendMessage(primer chunk) -> obtiene message_id
+    -> editMessageText cada ~1s (streaming progresivo)
+    -> editMessageText final (texto completo)
+    -> DynamoDB: save_message(bot) + update_metadata (paralelo)
   <- stream cerrado (tx dropped)
 ```
 
@@ -48,7 +62,7 @@ Soporta mensajes de **texto** y **fotos** (con o sin caption). Para fotos, desca
 |---------------------------|-------------------------------|------------------------------------------------------|
 | `BedrockStreamFunction`   | `AWS::Serverless::Function`   | Lambda Rust, provided.al2023, ARM64 (Graviton)       |
 | `ApiGatewayLambdaRole`    | `AWS::IAM::Role`              | Rol que API Gateway asume para invocar Lambda         |
-| `StreamApi`               | `AWS::Serverless::Api`        | API Gateway REST con OpenAPI y streaming habilitado   |
+| `ChatHistoryTable`        | `AWS::DynamoDB::Table`        | Historial de chat (single-table, on-demand, TTL 30d) |
 | `BedrockStreamLogGroup`   | `AWS::Logs::LogGroup`         | CloudWatch Logs con retencion de 14 dias              |
 
 ## Prerequisitos
@@ -127,6 +141,14 @@ region = "us-west-2"
 | `LambdaMemorySize` | `256`                                  | Memoria de la Lambda (MB)                 |
 | `LambdaTimeout`    | `120`                                  | Timeout de la Lambda (segundos)           |
 
+### Variables de entorno de la Lambda
+
+| Variable | Fuente | Descripcion |
+|----------|--------|-------------|
+| `BEDROCK_MODEL_ID` | Parametro `BedrockModelId` | Model ID de Bedrock |
+| `TELEGRAM_BOT_TOKEN` | Parametro `TelegramBotToken` | Token del bot de Telegram |
+| `CHAT_HISTORY_TABLE` | `!Ref ChatHistoryTable` | Nombre de la tabla DynamoDB para historial de chat |
+
 ## Integracion con Telegram
 
 La Lambda detecta automaticamente si el body es un webhook de Telegram (presencia de `update_id` + `message`) y lo procesa con streaming progresivo. Soporta mensajes de texto y fotos con vision (multimodal).
@@ -190,10 +212,10 @@ curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getWebhookInfo" | jq .
 # Via SAM deploy
 sam deploy --parameter-overrides TelegramBotToken=$TELEGRAM_TOKEN
 
-# O directamente en la Lambda
+# O directamente en la Lambda (incluir CHAT_HISTORY_TABLE)
 aws lambda update-function-configuration \
   --function-name rust-stream-bedrock-stream \
-  --environment "Variables={BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6,TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN}"
+  --environment "Variables={BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6,TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN,CHAT_HISTORY_TABLE=rust-stream-chat-history}"
 ```
 
 ### Como funciona el streaming en Telegram
@@ -215,6 +237,86 @@ A diferencia del flujo directo donde Lambda hace streaming via el channel al cli
 | Imagen (foto con vision) | 4096 |
 
 Si la respuesta excede 4096 caracteres (limite de Telegram), se trunca con sufijo `… [truncado]`.
+
+### Memoria de conversacion (DynamoDB)
+
+El bot mantiene historial de conversacion por chat usando una tabla DynamoDB con diseño single-table.
+
+#### Diseño de tabla
+
+| PK | SK | Descripcion |
+|----|-----|-------------|
+| `CHAT#<chat_id>` | `TS#<epoch_millis>` | Mensaje (user o assistant) |
+| `CHAT#<chat_id>` | `METADATA#<chat_id>` | Metadata del chat |
+
+#### Ejemplo de mensaje (user)
+
+```json
+{
+  "PK": "CHAT#795876358",
+  "SK": "TS#1775643623000",
+  "chat_id": 795876358,
+  "user_id": 795876358,
+  "update_id": 40966043,
+  "message_id": 4742,
+  "role": "user",
+  "text": "Holaaaa",
+  "source": "telegram",
+  "created_at": "2026-04-08T10:20:23Z",
+  "created_at_epoch": 1775643623,
+  "ttl": 1778235623
+}
+```
+
+#### Ejemplo de mensaje (assistant)
+
+```json
+{
+  "PK": "CHAT#795876358",
+  "SK": "TS#1775643625123",
+  "chat_id": 795876358,
+  "message_id": 4743,
+  "role": "assistant",
+  "text": "Hola, como estas?",
+  "source": "bedrock",
+  "reply_to_message_id": 4742,
+  "created_at": "2026-04-08T10:20:25Z",
+  "created_at_epoch": 1775643625,
+  "ttl": 1778235625
+}
+```
+
+#### Ejemplo de metadata
+
+```json
+{
+  "PK": "CHAT#795876358",
+  "SK": "METADATA#795876358",
+  "last_update_id": 40966043,
+  "last_message_at": "2026-04-08T10:20:25Z",
+  "first_name": "Esteban",
+  "language_code": "es",
+  "message_count": 37,
+  "last_model": "us.anthropic.claude-sonnet-4-6",
+  "updated_at": "2026-04-08T10:20:25Z"
+}
+```
+
+#### Logica de memoria
+
+1. **Inicio**: Lee metadata + ultimos 10 mensajes en paralelo (`tokio::join!`)
+2. **Deduplicacion**: Si `update_id <= metadata.last_update_id`, ignora el webhook (previene duplicados por reintentos de Telegram)
+3. **Guarda mensaje del usuario** antes de invocar Bedrock (si Lambda hace timeout, al menos el mensaje queda registrado)
+4. **System prompt**: Inyecta nombre del usuario, idioma preferido y conteo de mensajes en el campo `system` del payload de Bedrock
+5. **Historial**: Los ultimos 10 mensajes se incluyen en el array `messages` antes del mensaje actual
+6. **Post-stream**: Guarda la respuesta del bot y actualiza la metadata en paralelo
+7. **Fotos en historial**: Se almacenan como texto `[Foto] <caption>` (no se guarda base64)
+8. **TTL**: Cada item expira automaticamente a los 30 dias via DynamoDB TTL
+9. **Errores de DynamoDB**: Se loguean pero no interrumpen el flujo (degradacion graceful al comportamiento stateless)
+
+#### Comando /clear
+
+Enviar `/clear` al bot borra todo el historial del chat (mensajes + metadata) y responde con "Historial borrado".
 
 ### Eliminar el webhook
 
@@ -247,14 +349,28 @@ sam delete --stack-name rust-stream
 ## Politica IAM minima para el rol Lambda
 
 ```json
-{
-  "Effect": "Allow",
-  "Action": [
-    "bedrock:InvokeModel",
-    "bedrock:InvokeModelWithResponseStream"
-  ],
-  "Resource": "arn:aws:bedrock:REGION::foundation-model/*"
-}
+[
+  {
+    "Effect": "Allow",
+    "Action": [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream"
+    ],
+    "Resource": "arn:aws:bedrock:REGION::foundation-model/*"
+  },
+  {
+    "Effect": "Allow",
+    "Action": [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Query",
+      "dynamodb:DeleteItem",
+      "dynamodb:BatchWriteItem"
+    ],
+    "Resource": "arn:aws:dynamodb:REGION:ACCOUNT:table/STACK-chat-history"
+  }
+]
 ```
 
 ## Pruebas
@@ -365,6 +481,9 @@ cargo test test_responses
 
 # Tests de Telegram (deteccion, deserializacion, fotos)
 cargo test test_telegram
+
+# Tests de DynamoDB (system prompt, historial, epoch, TTL)
+cargo test test_dynamo
 ```
 
 ### Verificar logs en CloudWatch
@@ -383,6 +502,8 @@ Los logs son JSON estructurados (`LogFormat: JSON` en Globals) con campos para c
 | `msg_id` | ID del mensaje de Telegram que se edita progresivamente |
 | `image_bytes` | Tamano de la imagen descargada de Telegram (solo fotos) |
 | `media_type` | Tipo MIME de la imagen descargada (`image/jpeg`, etc.) |
+| `deleted` | Items eliminados por `/clear` |
+| `last_update_id` | Ultimo update_id procesado (deduplicacion) |
 
 ```bash
 # Ver logs recientes de la Lambda
@@ -435,8 +556,8 @@ Request 1 (cold start)          Request 2 (warm)            Request 3 (warm)
       ~100ms init                    ~0ms init                   ~0ms init
 ```
 
-- **`main()`** corre una sola vez por contenedor: inicializa el `BedrockClient`, el tracing subscriber y el AWS config. Estos se reutilizan en invocaciones posteriores.
-- **`handler()`** se ejecuta en cada invocacion pero reutiliza el cliente de Bedrock. Detecta si el body es un `PromptRequest` o un `TelegramUpdate` y enruta al flujo correspondiente.
+- **`main()`** corre una sola vez por contenedor: inicializa el `BedrockClient`, el `DynamoDbClient`, el `ChatHistory` service, el tracing subscriber y el AWS config. Estos se reutilizan en invocaciones posteriores.
+- **`handler()`** se ejecuta en cada invocacion pero reutiliza los clientes de Bedrock y DynamoDB. Detecta si el body es un `PromptRequest` o un `TelegramUpdate` y enruta al flujo correspondiente.
 - El campo `cold_start` en los logs marca `true` solo la primera invocacion de cada contenedor.
 
 ## Costos del streaming
@@ -479,7 +600,7 @@ lambda_runtime = { version = "1.1.2", features = ["concurrency-tokio"] }
 
 ```rust
 // En main():
-lambda_runtime::run_concurrent(service_fn(|ev| handler(&bedrock, ev))).await
+lambda_runtime::run_concurrent(service_fn(|ev| handler(&bedrock, &chat_history, ev))).await
 ```
 
 Sin este cambio, la funcion retornara un error en runtime cuando `AWS_LAMBDA_MAX_CONCURRENCY` este activo.

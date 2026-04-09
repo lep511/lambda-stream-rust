@@ -1,6 +1,7 @@
 /// Lógica de negocio reutilizable para Lambda Bedrock Streaming.
 ///
 /// Modelo soportado: Anthropic Claude Sonnet 4.6 vía Bedrock.
+pub mod dynamo;
 pub mod stream_markdown;
 pub mod telegram;
 
@@ -99,4 +100,18 @@ pub fn build_model_body(req: &PromptRequest) -> Option<Value> {
         "max_tokens": req.max_tokens,
         "messages": messages
     }))
+}
+
+/// Construye el body para Bedrock con system prompt y mensajes (con historial).
+pub fn build_model_body_with_context(
+    max_tokens: u32,
+    system: &str,
+    messages: Vec<Value>,
+) -> Value {
+    json!({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages
+    })
 }

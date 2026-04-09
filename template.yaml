@@ -42,12 +42,13 @@ Resources:
       Architectures:
         - arm64
       CodeUri: .
-      MemorySize: 128
+      MemorySize: 256
       Timeout: 120
       Environment:
         Variables:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          CHAT_HISTORY_TABLE: !Ref ChatHistoryTable
       Policies:
         - Statement:
             - Effect: Allow
@@ -58,6 +59,17 @@ Resources:
               Resource:
                 - "arn:aws:bedrock:*::foundation-model/*"
                 - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
+              Resource:
+                - !GetAtt ChatHistoryTable.Arn
 
   # ── Rol IAM para que API Gateway invoque Lambda con streaming ─────────
 
@@ -85,6 +97,27 @@ Resources:
                   - lambda:InvokeFunctionUrl
                 Resource: !GetAtt BedrockStreamFunction.Arn
 
+  # ── DynamoDB — Historial de chat ────────────────────────────────────────
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-chat-history"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
   # ── Log Group (retención explícita) ──────────────────────────────────────
 
   BedrockStreamLogGroup:
@@ -107,4 +140,12 @@ Outputs:
   ApiGatewayLambdaRoleArn:
     Description: ARN of the IAM Role
     Value: !GetAtt ApiGatewayLambdaRole.Arn
+
+  ChatHistoryTableName:
+    Description: Name of the DynamoDB chat history table
+    Value: !Ref ChatHistoryTable
+
+  ChatHistoryTableArn:
+    Description: ARN of the DynamoDB chat history table
+    Value: !GetAtt ChatHistoryTable.Arn
 

@@ -19,8 +19,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    build_model_body_with_context,
     default_max_tokens, default_model,
     extract_text_delta, streaming_response,
+    dynamo::{ChatHistory, ChatMessage, epoch_to_iso8601, now_epoch_secs},
 };
 use crate::stream_markdown::md_to_telegram_markdownv2;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -35,6 +37,14 @@ const INITIAL_MESSAGE_MIN_CHARS: usize = 15;
 /// Intervalo mínimo entre ediciones del mensaje en Telegram (ms).
 /// Evita rate-limiting de la Bot API (~30 req/s por chat).
 const EDIT_THROTTLE_MS: u128 = 1000;
+
+/// Texto de comandos disponibles (pre-escapado para MarkdownV2).
+/// Reutilizado por /start y /help.
+const COMMANDS_TEXT: &str = "\
+*Comandos disponibles:*\n\
+/start \\— Saludo de bienvenida\n\
+/help \\— Información y ayuda del bot\n\
+/clear \\— Borrar el historial de conversación";
 
 // ─── Tipos de Telegram ─────────────────────────────────────────────────────
 
@@ -234,6 +244,7 @@ pub fn is_telegram_update(body: &str) -> bool {
 /// se retorna 200 al webhook para evitar reintentos.
 pub async fn use_telegram(
     bedrock: &BedrockClient,
+    chat_history: &ChatHistory,
     body_str: &str,
     request_id: &str,
 ) -> Result<Response<Body>, Error> {
@@ -312,6 +323,22 @@ pub async fn use_telegram(
     let model_id = default_model();
     let max_tokens = default_max_tokens();
 
+    // 4. Extraer campos del usuario antes del spawn
+    let update_id = update.update_id;
+    let user_message_id = message.message_id;
+    let message_date = message.date;
+    let user_id = message.from.as_ref().map(|f| f.id);
+    let user_first_name = message.from.as_ref()
+        .map(|f| f.first_name.clone())
+        .unwrap_or_default();
+    let user_language = message.from.as_ref()
+        .and_then(|f| f.language_code.clone());
+    let user_text_for_db = match &user_input {
+        UserInput::Text(t) => t.clone(),
+        UserInput::Photo { caption, .. } => format!("[Foto] {caption}"),
+    };
+    let input_has_photo = matches!(&user_input, UserInput::Photo { .. });
+
     // 5. Crear canal de streaming Lambda
     //    tx se mueve al spawn — Lambda mantiene la invocación abierta mientras tx exista.
     //    El send_data("{}" ) se hace DENTRO del spawn para que Lambda no cierre antes.
@@ -320,6 +347,7 @@ pub async fn use_telegram(
     // 6. Spawn: enviar 200 OK + procesar Bedrock + Telegram
     let rid = request_id.to_string();
     let bedrock = bedrock.clone();
+    let chat_history = chat_history.clone();
 
     tokio::spawn(async move {
         let mut tx = tx; // tomar ownership explícito de tx
@@ -328,18 +356,132 @@ pub async fn use_telegram(
         // 7.0 Enviar el body "{}" por el canal — Telegram recibe su 200 OK
         let _ = tx.send_data(Bytes::from_static(b"{}")).await;
 
-        // 7a. Enviar typing indicator (sin placeholder visible)
+        // 7a. Detectar comandos
+        if let UserInput::Text(ref t) = user_input {
+            let cmd = t.trim();
+            if cmd == "/start" {
+                let greeting = format!(
+                    "Hola, {name} 👋\n\n\
+                     Soy tu asistente de IA\\. Puedes escribirme lo que quieras y te responderé\\.\n\n\
+                     {cmds}",
+                    name = escape_markdownv2(&user_first_name),
+                    cmds = COMMANDS_TEXT,
+                );
+                send_telegram_message(
+                    &http_client, &bot_token, chat_id, &greeting,
+                ).await;
+                return;
+            }
+            if cmd == "/help" {
+                let help = format!(
+                    "ℹ️ *Acerca del bot*\n\n\
+                     Este bot usa Claude de Anthropic vía Amazon Bedrock \
+                     para responder tus mensajes\\. Puedes enviar texto o fotos\\.\n\n\
+                     El bot recuerda los últimos mensajes de la conversación \
+                     para mantener el contexto\\.\n\n\
+                     {cmds}",
+                    cmds = COMMANDS_TEXT,
+                );
+                send_telegram_message(
+                    &http_client, &bot_token, chat_id, &help,
+                ).await;
+                return;
+            }
+            if cmd == "/clear" {
+                match chat_history.delete_chat_history(chat_id).await {
+                    Ok(count) => {
+                        tracing::info!(
+                            request_id = rid, chat_id, deleted = count,
+                            "historial de chat borrado"
+                        );
+                        send_telegram_message(
+                            &http_client, &bot_token, chat_id,
+                            "Historial borrado\\.",
+                        ).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            request_id = rid, chat_id, error = %e,
+                            "error al borrar historial"
+                        );
+                        send_telegram_message(
+                            &http_client, &bot_token, chat_id,
+                            "Error al borrar el historial\\.",
+                        ).await;
+                    }
+                }
+                return;
+            }
+        }
+
+        // 7b. Enviar typing indicator (sin placeholder visible)
         send_chat_action(&http_client, &bot_token, chat_id).await;
 
-        // 7a.1 Construir payload de Bedrock (descarga imagen si es foto)
-        let blob = match user_input {
+        // 7c. Obtener metadata e historial en paralelo
+        let (metadata_result, history_result) = tokio::join!(
+            chat_history.get_metadata(chat_id),
+            chat_history.get_recent_messages(chat_id, 10),
+        );
+
+        let metadata = metadata_result.unwrap_or_else(|e| {
+            tracing::warn!(
+                request_id = rid, error = %e,
+                "error al obtener metadata, continuando sin contexto"
+            );
+            None
+        });
+        let history = history_result.unwrap_or_else(|e| {
+            tracing::warn!(
+                request_id = rid, error = %e,
+                "error al obtener historial, continuando sin contexto"
+            );
+            Vec::new()
+        });
+
+        // 7d. Deduplicación: ignorar si ya procesamos este update
+        if let Some(ref meta) = metadata {
+            if update_id <= meta.last_update_id {
+                tracing::warn!(
+                    request_id = rid,
+                    update_id,
+                    last_update_id = meta.last_update_id,
+                    "update duplicado detectado, ignorando"
+                );
+                return;
+            }
+        }
+
+        // 7e. Guardar mensaje del usuario ANTES de invocar Bedrock
+        let user_msg = ChatMessage {
+            chat_id,
+            message_id: user_message_id,
+            update_id: Some(update_id),
+            user_id,
+            role: "user".to_string(),
+            text: user_text_for_db.clone(),
+            source: "telegram".to_string(),
+            has_photo: input_has_photo,
+            reply_to_message_id: None,
+            created_at: epoch_to_iso8601(message_date),
+            created_at_epoch: message_date,
+        };
+        if let Err(e) = chat_history.save_message(&user_msg).await {
+            tracing::warn!(
+                request_id = rid, error = %e,
+                "error al guardar mensaje del usuario"
+            );
+        }
+
+        // 7f. Construir system prompt y mensajes con historial
+        let system_prompt = ChatHistory::build_system_prompt(
+            &metadata, &user_first_name, &user_language,
+        );
+        let mut bedrock_messages = ChatHistory::build_bedrock_messages(&history);
+
+        // 7g. Construir payload de Bedrock (descarga imagen si es foto)
+        let current_message = match user_input {
             UserInput::Text(ref text) => {
-                let body = json!({
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": max_tokens,
-                    "messages": [{"role": "user", "content": text}]
-                });
-                Blob::new(serde_json::to_vec(&body).unwrap())
+                json!({"role": "user", "content": text})
             }
             UserInput::Photo { ref file_id, ref caption } => {
                 let Some((image_data, media_type)) = download_telegram_photo(
@@ -362,30 +504,33 @@ pub async fn use_telegram(
                     "imagen descargada de Telegram"
                 );
                 let b64 = BASE64.encode(&image_data);
-                let body = json!({
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 4096,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": b64,
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": caption,
+                json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64,
                             }
-                        ]
-                    }]
-                });
-                Blob::new(serde_json::to_vec(&body).unwrap())
+                        },
+                        {
+                            "type": "text",
+                            "text": caption,
+                        }
+                    ]
+                })
             }
         };
+        bedrock_messages.push(current_message);
+
+        let bedrock_body = build_model_body_with_context(
+            if input_has_photo { 4096 } else { max_tokens },
+            &system_prompt,
+            bedrock_messages,
+        );
+        let blob = Blob::new(serde_json::to_vec(&bedrock_body).unwrap());
 
         // 7b. Invocar Bedrock con streaming
         tracing::info!(
@@ -584,6 +729,41 @@ pub async fn use_telegram(
             total_duration_ms = start.elapsed().as_millis() as u64,
             "respuesta streaming completada en Telegram"
         );
+
+        // 7h. Guardar respuesta del bot y actualizar metadata en paralelo
+        let bot_msg = ChatMessage {
+            chat_id,
+            message_id: msg_id.unwrap_or(0),
+            update_id: None,
+            user_id: None,
+            role: "assistant".to_string(),
+            text: response_text.clone(),
+            source: "bedrock".to_string(),
+            has_photo: false,
+            reply_to_message_id: Some(user_message_id),
+            created_at: epoch_to_iso8601(now_epoch_secs()),
+            created_at_epoch: now_epoch_secs(),
+        };
+
+        let lang_ref = user_language.as_deref();
+        let (save_result, meta_result) = tokio::join!(
+            chat_history.save_message(&bot_msg),
+            chat_history.update_metadata(
+                chat_id, update_id, &user_first_name, lang_ref, &model_id,
+            ),
+        );
+        if let Err(e) = save_result {
+            tracing::error!(
+                request_id = rid, error = %e,
+                "error al guardar respuesta del bot"
+            );
+        }
+        if let Err(e) = meta_result {
+            tracing::warn!(
+                request_id = rid, error = %e,
+                "error al actualizar metadata del chat"
+            );
+        }
 
         // tx se dropea aquí, cerrando el stream de Lambda
     });
@@ -858,6 +1038,19 @@ async fn download_telegram_photo(
 /// Telegram requiere que el webhook responda con 200 para confirmar
 /// la recepción del update. Si se responde con otro código, Telegram
 /// reintentará el envío del update.
+/// Escapa caracteres especiales de MarkdownV2 en texto plano.
+fn escape_markdownv2(text: &str) -> String {
+    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\'];
+    let mut escaped = String::with_capacity(text.len() * 2);
+    for ch in text.chars() {
+        if special.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn ok_empty_response() -> Response<Body> {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use aws_sdk_bedrockruntime::{Client as BedrockClient, types::ResponseStream};
+use aws_sdk_dynamodb::Client as DynamoDbClient;
 use aws_smithy_types::Blob;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode, header::HeaderValue};
@@ -25,6 +26,7 @@ use serde_json::Value;
 use stream_rust::{
     PromptRequest, build_model_body, error_response, extract_text_delta, is_known_model,
     streaming_response,
+    dynamo::ChatHistory,
 };
 
 static COLD_START: AtomicBool = AtomicBool::new(true);
@@ -41,6 +43,7 @@ struct ApiGatewayEvent {
 
 async fn handler(
     bedrock: &BedrockClient,
+    chat_history: &ChatHistory,
     event: LambdaEvent<Value>,
 ) -> Result<Response<Body>, Error> {
     let request_id = &event.context.request_id;
@@ -90,7 +93,7 @@ async fn handler(
     // Detectar si es un webhook de Telegram y derivar al handler específico
     if stream_rust::telegram::is_telegram_update(&body_str) {
         tracing::info!(request_id, "webhook de Telegram detectado");
-        return stream_rust::telegram::use_telegram(bedrock, &body_str, request_id).await;
+        return stream_rust::telegram::use_telegram(bedrock, chat_history, &body_str, request_id).await;
     }
 
     let req: PromptRequest = match serde_json::from_str(&body_str) {
@@ -278,7 +281,13 @@ async fn main() -> Result<(), Error> {
 
     let aws_config = aws_config::from_env().load().await;
     let bedrock = BedrockClient::new(&aws_config);
+    let dynamo = DynamoDbClient::new(&aws_config);
+    let table_name = std::env::var("CHAT_HISTORY_TABLE")
+        .unwrap_or_else(|_| "chat-history".to_string());
+    let chat_history = ChatHistory::new(dynamo, table_name);
 
     // run() detecta streaming automáticamente por el tipo StreamResponse<Body>
-    lambda_runtime::run(service_fn(|ev: LambdaEvent<Value>| handler(&bedrock, ev))).await
+    lambda_runtime::run(service_fn(|ev: LambdaEvent<Value>| {
+        handler(&bedrock, &chat_history, ev)
+    })).await
 }
