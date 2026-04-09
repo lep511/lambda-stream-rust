@@ -590,6 +590,42 @@ El beneficio del streaming es mejorar el TTFB: el usuario ve texto llegando inme
 - Para Telegram, el `tokio::spawn` cumple doble funcion: retorna 200 al webhook inmediatamente y mantiene la Lambda viva mientras procesa el stream de Bedrock y edita el mensaje.
 - Cold start con Rust + ARM64 (Graviton2) ~ 80-120ms.
 
+## Mejoras futuras
+
+### Generacion automatica de summary por usuario
+
+Actualmente el campo `summary` en la metadata del chat (`METADATA#<chat_id>`) se puede poblar manualmente en DynamoDB y el bot lo inyecta en el system prompt para personalizar las respuestas. La mejora propuesta es un sistema separado que genere y actualice este summary automaticamente.
+
+#### Propuesta
+
+Un proceso independiente (Lambda scheduled o Step Function) que:
+
+1. **Trigger**: Se ejecuta periodicamente (ej. cada N mensajes o via EventBridge cada X horas)
+2. **Lee** los ultimos mensajes del chat desde DynamoDB
+3. **Invoca** un modelo de Bedrock (puede ser Haiku para minimizar costos) con un prompt del estilo: _"A partir de esta conversacion, genera un resumen breve del usuario: intereses, estilo de comunicacion, temas frecuentes, preferencias"_
+4. **Escribe** el resultado en el campo `summary` de `METADATA#<chat_id>`
+
+#### Diseño sugerido
+
+```
+EventBridge (schedule)
+  |
+  v
+Lambda (summary-generator)
+  |
+  ├─ DynamoDB: Query ultimos N mensajes por chat
+  ├─ Bedrock: Invoke (Haiku) con prompt de resumen
+  └─ DynamoDB: UpdateItem -> METADATA#<chat_id>.summary
+```
+
+#### Consideraciones
+
+- **Modelo**: Usar un modelo economico (Haiku) ya que el summary no requiere razonamiento complejo
+- **Frecuencia**: No hace falta generar en cada mensaje; cada 20-50 mensajes o cada 24h es suficiente
+- **Longitud**: Limitar el summary a ~200-300 tokens para no inflar el system prompt
+- **Privacidad**: El summary contiene informacion personal derivada de las conversaciones — considerar politicas de retencion y acceso
+- **Campo de control**: Agregar un campo `summary_updated_at` y `summary_message_count` en la metadata para saber cuando se genero el ultimo summary y evitar regeneraciones innecesarias
+
 ## Concurrencia (provisioned concurrency)
 
 Si configuras `AWS_LAMBDA_MAX_CONCURRENCY` (para provisioned concurrency con multi-request mode), debes usar `run_concurrent()` en lugar de `run()`. Esto requiere habilitar la feature `concurrency-tokio` en `lambda_runtime`:
