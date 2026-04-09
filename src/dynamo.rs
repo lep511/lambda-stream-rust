@@ -54,6 +54,7 @@ pub struct ChatMetadata {
     pub message_count: i64,
     pub last_model: String,
     pub updated_at: String,
+    pub summary: Option<String>,
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -159,6 +160,7 @@ impl ChatHistory {
             message_count: get_n(&item, "message_count").unwrap_or(0),
             last_model: get_s(&item, "last_model").unwrap_or_default(),
             updated_at: get_s(&item, "updated_at").unwrap_or_default(),
+            summary: get_s(&item, "summary"),
         }))
     }
 
@@ -427,6 +429,13 @@ impl ChatHistory {
                     "\nYou have exchanged {} messages with this user previously.",
                     meta.message_count
                 ));
+            }
+            if let Some(ref summary) = meta.summary {
+                if !summary.is_empty() {
+                    prompt.push_str(&format!(
+                        "\nUser summary: {summary}"
+                    ));
+                }
             }
         }
 
